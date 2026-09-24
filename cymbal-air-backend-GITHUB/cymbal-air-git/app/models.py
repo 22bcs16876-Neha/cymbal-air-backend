@@ -141,6 +141,21 @@ class SupportTransfer(Base):
     created_at = Column(DateTime, default=dt.datetime.utcnow)
 
 
+class HumanEscalation(Base):
+    """Audit record for conversations escalated to a human agent."""
+    __tablename__ = "human_escalations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    queue_id = Column(String, unique=True, index=True, nullable=False)
+    phone_number = Column(String, nullable=True)
+    session_id = Column(String, nullable=True, index=True)
+    reason = Column(String, nullable=False)
+    wrong_input_count = Column(Integer, default=0)
+    transcript_summary = Column(String, nullable=True)
+    status = Column(String, default="QUEUED")
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
+
 class FlightIssueReport(Base):
     __tablename__ = "flight_issue_reports"
 
