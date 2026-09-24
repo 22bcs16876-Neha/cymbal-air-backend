@@ -16,7 +16,7 @@ app = FastAPI(
         "REST backend for the Cymbal Air CX Agent Studio agent. "
         "One POST endpoint per agent Tool, matching the original tool names."
     ),
-    version="1.2.0",
+    version="1.1.0",
     openapi_url="/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -200,89 +200,6 @@ def update_transfer_reason(payload: schemas.TransferReasonIn, db: Session = Depe
 
 
 # =========================================================================
-# HUMAN ESCALATION / OUT-OF-SCOPE GUARDRAIL
-# =========================================================================
-
-@app.post("/tools/handle_wrong_input", tags=["human_escalation"])
-def handle_wrong_input(payload: schemas.WrongInputIn, db: Session = Depends(get_db)):
-    """
-    Stateless 3-strike guardrail for CX Agent Studio.
-
-    The agent should call this endpoint whenever the current user turn is
-    classified as invalid/out-of-scope. On the third consecutive strike,
-    this endpoint creates a human escalation record and returns
-    should_escalate=true.
-    """
-    new_count = max(0, payload.current_count) + 1
-    if new_count < 3:
-        return {
-            "should_escalate": False,
-            "wrong_input_count": new_count,
-            "message": f"Invalid/out-of-scope input detected. Attempt {new_count} of 3."
-        }
-
-    queue_id = f"HUMAN-{uuid.uuid4().hex[:10].upper()}"
-    reason = payload.reason or "out_of_scope_or_invalid_input"
-    db.add(models.HumanEscalation(
-        queue_id=queue_id,
-        phone_number=payload.phone_number,
-        session_id=payload.session_id,
-        reason=reason,
-        wrong_input_count=new_count,
-        transcript_summary=payload.input_text,
-        status="QUEUED",
-    ))
-    db.commit()
-    return {
-        "should_escalate": True,
-        "wrong_input_count": new_count,
-        "queue_id": queue_id,
-        "status": "QUEUED",
-        "transfer_reason": "max_no_match",
-        "message": "Three invalid or out-of-scope inputs were detected. Transfer the conversation to a human agent now."
-    }
-
-
-@app.post("/tools/escalate_to_human", tags=["human_escalation"])
-def escalate_to_human(payload: schemas.HumanEscalationIn, db: Session = Depends(get_db)):
-    """Create a human handoff record and return a queue identifier for the UI."""
-    queue_id = f"HUMAN-{uuid.uuid4().hex[:10].upper()}"
-    db.add(models.HumanEscalation(
-        queue_id=queue_id,
-        phone_number=payload.phone_number,
-        session_id=payload.session_id,
-        reason=payload.reason,
-        wrong_input_count=payload.wrong_input_count,
-        transcript_summary=payload.transcript_summary,
-        status="QUEUED",
-    ))
-    db.commit()
-    return {
-        "status": "QUEUED",
-        "queue_id": queue_id,
-        "handoff_required": True,
-        "transfer_reason": "agent",
-        "message": "A human support agent has been requested. Keep the conversation open for handoff."
-    }
-
-
-@app.get("/tools/human_escalation/{queue_id}", tags=["human_escalation"])
-def get_human_escalation(queue_id: str, db: Session = Depends(get_db)):
-    record = db.query(models.HumanEscalation).filter(
-        models.HumanEscalation.queue_id == queue_id.upper()
-    ).first()
-    if not record:
-        raise HTTPException(status_code=404, detail="Human escalation not found.")
-    return {
-        "queue_id": record.queue_id,
-        "status": record.status,
-        "reason": record.reason,
-        "wrong_input_count": record.wrong_input_count,
-        "created_at": record.created_at.isoformat() if record.created_at else None,
-    }
-
-
-# =========================================================================
 # FLIGHTS
 # =========================================================================
 
@@ -320,83 +237,6 @@ def get_flight_details(payload: schemas.FlightDetailsIn, db: Session = Depends(g
         "flight_number": r.flight_number, "origin": r.origin, "destination": r.destination,
         "departure_time": r.departure_time, "arrival_time": r.arrival_time,
         "terminal": r.terminal, "gate": r.gate, "status": r.status,
-    }
-
-
-@app.post("/tools/create_flight_booking", tags=["flights", "bookings"])
-def create_flight_booking(payload: schemas.FlightBookingIn, db: Session = Depends(get_db)):
-    """
-    Create a new flight booking from a flight returned by get_flights.
-
-    This was missing from the original backend: the agent could search flights
-    but had no tool that actually created a booking.
-    """
-    flight_number = payload.flight_number.strip().upper()
-    flight = db.query(models.Flight).filter(
-        models.Flight.flight_number == flight_number
-    ).first()
-
-    if not flight:
-        return {
-            "status": "NOT_FOUND",
-            "booking_created": False,
-            "message": f"Flight {flight_number} was not found."
-        }
-
-    if (flight.status or "").lower() == "cancelled":
-        return {
-            "status": "UNAVAILABLE",
-            "booking_created": False,
-            "message": f"Flight {flight_number} is cancelled and cannot be booked."
-        }
-
-    origin = (payload.origin or flight.origin).strip()
-    destination = (payload.destination or flight.destination).strip()
-    cabin = (payload.cabin_class or flight.cabin_class or "economy").strip().lower()
-    passenger_name = payload.passenger_name.strip()
-
-    if not passenger_name:
-        return {"status": "INVALID", "booking_created": False,
-                "message": "Passenger name is required."}
-
-    # Use a collision-resistant reference suitable for the demo backend.
-    ref = f"CA-{uuid.uuid4().hex[:8].upper()}"
-
-    booking = models.Booking(
-        booking_reference=ref,
-        user_phone=payload.phone_number,
-        booking_name=passenger_name.lower(),
-        flight_number=flight.flight_number,
-        origin=origin,
-        destination=destination,
-        departure_date=payload.departure_date,
-        booking_date=dt.date.today().isoformat(),
-        booking_time=flight.departure_time,
-        booking_status="CONFIRMED",
-        amount_due=flight.price,
-        currency=flight.currency or "USD",
-        original_payment_method=None,
-        refund_eligible=True,
-        refund_amount=flight.price,
-        refund_fee=0.0,
-    )
-    db.add(booking)
-    db.commit()
-
-    return {
-        "status": "CONFIRMED",
-        "booking_created": True,
-        "booking_reference": ref,
-        "flight_number": flight.flight_number,
-        "origin": origin,
-        "destination": destination,
-        "departure_date": payload.departure_date,
-        "departure_time": flight.departure_time,
-        "passenger_name": passenger_name,
-        "cabin_class": cabin,
-        "amount_due": flight.price,
-        "currency": flight.currency or "USD",
-        "message": f"Flight {flight.flight_number} has been booked successfully. Booking reference: {ref}."
     }
 
 
